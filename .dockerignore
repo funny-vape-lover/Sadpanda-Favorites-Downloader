@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite
+.git/
+.gitignore
+Download_folders/
+thumbnails/
+exhentai_cache.json
+worker_state.json

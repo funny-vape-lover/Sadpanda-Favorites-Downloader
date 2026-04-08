@@ -1,0 +1,6 @@
+streamlit>=1.42
+pandas>=2.2
+requests>=2.31
+beautifulsoup4>=4.12
+qbittorrent-api>=2024.4
+torf>=4.2.0

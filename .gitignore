@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+worker_state.json
+exhentai_cache.json
+favorites.txt
+thumbnails/
+Download_folders/
+config.json
+.streamlit/
+.env
+.env.*

@@ -1,0 +1,34 @@
+{
+  "exhentai": {
+    "cookies": ""
+  },
+  "downloader": {
+    "active_adapter": "qbittorrent_adapter"
+  },
+  "paths": {
+    "media_library": "/path/to/Sadpanda_Media",
+    "archive_library": "/path/to/Sadpanda_Archives"
+  },
+  "qbittorrent": {
+    "host": "http://localhost",
+    "port": 8080,
+    "username": "admin",
+    "password": "",
+    "download_path": "/path/to/Sadpanda_Torrents",
+    "metadata_stuck_recovery_minutes": 60,
+    "metadata_recovery_cooldown_minutes": 30
+  },
+  "torrent_upload": {
+    "staging_dir": "/path/to/Sadpanda_Archives/staging",
+    "generated_torrent_dir": "/path/to/Sadpanda_Archives/generated",
+    "piece_size_mb": 2,
+    "trackers_extra": [],
+    "max_batch_per_run": 5
+  },
+  "lanraragi": {
+    "enabled": false,
+    "base_url": "http://localhost:3000",
+    "api_key": "",
+    "sync_interval_minutes": 60
+  }
+}
