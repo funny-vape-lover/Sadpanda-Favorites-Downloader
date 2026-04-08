@@ -104,7 +104,6 @@ What each path is for:
 
 - `config.json`, `dashboard.db`, `thumbnails/`, and download folders are local runtime data and should not be committed.
 - The app currently assumes qBittorrent as the active torrent backend.
-- Advanced features such as archive-to-torrent upload exist in the codebase but are not covered in this quick-start guide.
 - Docker-related notes are in `README-deploy.md`.
 
 ## Troubleshooting
