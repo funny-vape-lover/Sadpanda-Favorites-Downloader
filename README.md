@@ -11,7 +11,10 @@ It can:
 - import finished files into a media library with hardlinks
 - track missing files and operational errors
 
+DISCLAIMER: Includes torrent and archive downloading functionality only. No scraping. 
+
 This README is intentionally focused on basic local setup.
+
 
 ## What runs
 
