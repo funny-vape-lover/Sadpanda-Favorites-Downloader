@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import time
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 import requests
 
 import database
+import media_importer
 
 
 LANRARAGI_FORCE_SYNC_KEY = "lanraragi_sync_requested"
@@ -29,6 +31,7 @@ NS_FAVORITE_CATEGORY = "favorite_category"
 NS_FAVORITE_NOTE = "favorite_note"
 NS_JAPANESE_TITLE = "japanese_title"
 NS_EXPUNGED = "expunged"
+NS_PREVIOUS_GID = "previous_gid"
 NS_GID = "gid"
 LANRARAGI_MANAGED_NAMESPACES = {
     NS_CATEGORY.casefold(),
@@ -41,6 +44,7 @@ LANRARAGI_MANAGED_NAMESPACES = {
     NS_FAVORITE_NOTE.casefold(),
     NS_JAPANESE_TITLE.casefold(),
     NS_EXPUNGED.casefold(),
+    NS_PREVIOUS_GID.casefold(),
     NS_GID.casefold(),
     # Legacy aliases to clean old sync/plugin output.
     "category",
@@ -62,6 +66,8 @@ LANRARAGI_MANAGED_NAMESPACES = {
     "Rating",
     "expunged",
     "Expunged",
+    "previous_gid",
+    "Previous GID",
     "gid",
     "GID",
     "exh_gid",
@@ -152,6 +158,40 @@ def sync_favorites_metadata(db_path: str | Path, lan_cfg: dict[str, Any]) -> dic
             continue
         try:
             candidate = _find_archive_candidate(session, base_url, gid)
+            matched_gid = gid
+            revision_candidates = list(item.get("revision_candidates", []))
+            if candidate is None and revision_candidates:
+                local_arcid, local_path = _compute_local_lanraragi_arcid(
+                    item=item,
+                    revision_candidates=revision_candidates,
+                    media_library=str(lan_cfg.get("media_library", "") or ""),
+                )
+                if local_arcid:
+                    for revision in revision_candidates:
+                        previous_gid = str(revision.get("gid", "") or "")
+                        if not previous_gid:
+                            continue
+                        previous_candidate = _find_archive_candidate(
+                            session,
+                            base_url,
+                            previous_gid,
+                        )
+                        if previous_candidate is None:
+                            continue
+                        candidate_arcid = str(previous_candidate.get("arcid", "") or "").lower()
+                        if candidate_arcid != local_arcid:
+                            print(
+                                f"Rejected LANraragi revision fallback for g-{gid} via "
+                                f"g-{previous_gid}: payload arcid mismatch."
+                            )
+                            continue
+                        candidate = previous_candidate
+                        matched_gid = previous_gid
+                        print(
+                            f"LANraragi revision fallback matched g-{gid} to g-{previous_gid} "
+                            f"using identical payload {local_arcid} ({local_path})."
+                        )
+                        break
             if candidate is None:
                 skipped += 1
                 continue
@@ -166,6 +206,7 @@ def sync_favorites_metadata(db_path: str | Path, lan_cfg: dict[str, Any]) -> dic
                 raw_tags=str(current.get("tags", "") or ""),
                 item=item,
                 gid=gid,
+                previous_gids=_revision_gid_values(revision_candidates, matched_gid),
             )
             next_title = (
                 unescape(str(item.get("title", "") or "")).strip()
@@ -213,12 +254,16 @@ def _normalize_lanraragi_config(config: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         interval = DEFAULT_SYNC_INTERVAL_MINUTES
     interval = max(1, interval)
+    paths_cfg = config.get("paths", {}) if isinstance(config, dict) else {}
+    if not isinstance(paths_cfg, dict):
+        paths_cfg = {}
 
     return {
         "enabled": bool(raw.get("enabled", False)),
         "base_url": str(raw.get("base_url", "") or "").strip(),
         "api_key": str(raw.get("api_key", "") or "").strip(),
         "sync_interval_minutes": interval,
+        "media_library": str(paths_cfg.get("media_library", "") or "").strip(),
     }
 
 
@@ -276,14 +321,158 @@ def _get_items_for_sync(db_path: str | Path) -> list[dict[str, Any]]:
                 expunged,
                 tags,
                 favorite_note,
-                favorited_epoch
+                favorited_epoch,
+                parent_gid,
+                first_gid
             FROM items
             WHERE COALESCE(is_latest_revision, 1) = 1
               AND (torrent_downloaded = 1 OR archive_downloaded = 1)
             ORDER BY favorited_epoch DESC, last_updated_epoch DESC
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    records, graph = _load_revision_graph(db_path)
+    for item in items:
+        item["revision_candidates"] = _get_revision_candidates(item, records, graph)
+    return items
+
+
+def _normalize_item_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = ITEM_ID_PATTERN.match(text)
+    if match:
+        return f"g-{match.group(1)}"
+    if text.isdigit():
+        return f"g-{text}"
+    return ""
+
+
+def _load_revision_graph(
+    db_path: str | Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]]]:
+    with database.get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, title, parent_gid, first_gid, superseded_by_id
+            FROM items
+            """
+        ).fetchall()
+
+    records: dict[str, dict[str, Any]] = {}
+    graph: dict[str, set[str]] = {}
+    for row in rows:
+        record = dict(row)
+        item_id = _normalize_item_id(record.get("id"))
+        if not item_id:
+            continue
+        records[item_id] = record
+        graph.setdefault(item_id, set())
+        related_ids = (
+            _normalize_item_id(record.get("parent_gid")),
+            _normalize_item_id(record.get("first_gid")),
+            _normalize_item_id(record.get("superseded_by_id")),
+        )
+        for related_id in related_ids:
+            if not related_id or related_id == item_id:
+                continue
+            graph.setdefault(related_id, set())
+            graph[item_id].add(related_id)
+            graph[related_id].add(item_id)
+    return records, graph
+
+
+def _get_revision_candidates(
+    item: dict[str, Any],
+    records: dict[str, dict[str, Any]],
+    graph: dict[str, set[str]],
+) -> list[dict[str, str]]:
+    item_id = _normalize_item_id(item.get("id"))
+    if not item_id:
+        return []
+
+    ordered_ids: list[str] = []
+    seen: set[str] = {item_id}
+
+    def add_candidate(candidate_id: str) -> None:
+        if candidate_id and candidate_id not in seen:
+            seen.add(candidate_id)
+            ordered_ids.append(candidate_id)
+
+    add_candidate(_normalize_item_id(item.get("parent_gid")))
+    add_candidate(_normalize_item_id(item.get("first_gid")))
+
+    queue = [item_id]
+    traversed = {item_id}
+    while queue:
+        current = queue.pop(0)
+        for related_id in sorted(graph.get(current, set())):
+            if related_id not in traversed:
+                traversed.add(related_id)
+                queue.append(related_id)
+            add_candidate(related_id)
+
+    candidates: list[dict[str, str]] = []
+    for candidate_id in ordered_ids:
+        gid = _extract_gid(candidate_id)
+        if not gid:
+            continue
+        record = records.get(candidate_id, {})
+        candidates.append(
+            {
+                "id": candidate_id,
+                "gid": gid,
+                "title": str(record.get("title", "") or ""),
+            }
+        )
+    return candidates
+
+
+def _compute_local_lanraragi_arcid(
+    *,
+    item: dict[str, Any],
+    revision_candidates: list[dict[str, str]],
+    media_library: str,
+) -> tuple[str, str]:
+    if not media_library:
+        return "", ""
+    library_path = Path(media_library).expanduser()
+    if not library_path.is_dir():
+        return "", ""
+
+    entries = media_importer._list_media_library_entries(library_path)  # type: ignore[attr-defined]
+    media_items = [
+        {"id": str(item.get("id", "") or ""), "title": str(item.get("title", "") or "")},
+        *revision_candidates,
+    ]
+    for media_item in media_items:
+        try:
+            path = media_importer._find_media_library_file(  # type: ignore[attr-defined]
+                library_path,
+                str(media_item.get("id", "") or ""),
+                str(media_item.get("title", "") or ""),
+                media_entries=entries,
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if not path.is_file():
+            continue
+        digest = hashlib.sha1()
+        with path.open("rb") as handle:
+            digest.update(handle.read(512000))
+        return digest.hexdigest(), str(path)
+    return "", ""
+
+
+def _revision_gid_values(
+    revision_candidates: list[dict[str, str]],
+    matched_gid: str,
+) -> list[str]:
+    values = [str(candidate.get("gid", "") or "") for candidate in revision_candidates]
+    if matched_gid and matched_gid not in values:
+        values.insert(0, matched_gid)
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _find_archive_candidate(
@@ -291,7 +480,14 @@ def _find_archive_candidate(
     base_url: str,
     gid: str,
 ) -> dict[str, Any] | None:
-    searches = [f"gid:{gid}", f"GID:{gid}", f"exh_gid:{gid}", f"g-[{gid}]", f"g-{gid}"]
+    searches = [
+        f"gid:{gid}",
+        f"GID:{gid}",
+        f"previous_gid:{gid}",
+        f"exh_gid:{gid}",
+        f"g-[{gid}]",
+        f"g-{gid}",
+    ]
     for search in searches:
         results = _search_archives(session, base_url, search)
         if not results:
@@ -332,6 +528,7 @@ def _has_gid_match(row: dict[str, Any], gid: str) -> bool:
     title = str(row.get("title", "") or "")
     return (
         f"gid:{gid}" in tags
+        or f"previous_gid:{gid}" in tags
         or f"exh_gid:{gid}" in tags
         or f"g-[{gid}]" in title
         or f"g-{gid}" in title
@@ -361,12 +558,14 @@ def _build_synced_tags(
     raw_tags: str,
     item: dict[str, Any],
     gid: str,
+    previous_gids: list[str] | None = None,
 ) -> str:
     # For now we do a full managed rewrite to keep output stable and avoid duplicates.
     gallery_tags = _drop_managed_tags(_parse_item_tags(item.get("tags", "")), LANRARAGI_MANAGED_NAMESPACES)
     managed_tags = _build_managed_metadata_tags(
         item=item,
         gid=gid,
+        previous_gids=previous_gids or [],
     )
     return ", ".join(_dedupe_tags([*gallery_tags, *managed_tags]))
 
@@ -375,6 +574,7 @@ def _build_managed_metadata_tags(
     *,
     item: dict[str, Any],
     gid: str,
+    previous_gids: list[str],
 ) -> list[str]:
     tags: list[str] = []
 
@@ -416,6 +616,9 @@ def _build_managed_metadata_tags(
 
     expunged = bool(item.get("expunged", False))
     tags.append(f"{NS_EXPUNGED}:{'Yes' if expunged else 'No'}")
+    for previous_gid in previous_gids:
+        if previous_gid and previous_gid != gid:
+            tags.append(f"{NS_PREVIOUS_GID}:{previous_gid}")
     tags.append(f"{NS_GID}:{gid}")
 
     return tags
