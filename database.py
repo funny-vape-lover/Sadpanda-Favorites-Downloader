@@ -128,6 +128,7 @@ def init_db(db_path: str | Path | None = None) -> None:
                 uploader_contains TEXT NOT NULL DEFAULT '',
                 title_contains TEXT NOT NULL DEFAULT '',
                 tags_contains TEXT NOT NULL DEFAULT '',
+                tags_not_contains TEXT NOT NULL DEFAULT '',
                 notes_contains TEXT NOT NULL DEFAULT '',
                 notes_not_contains TEXT NOT NULL DEFAULT '',
                 rating_min REAL,
@@ -235,6 +236,7 @@ def init_db(db_path: str | Path | None = None) -> None:
             for row in connection.execute("PRAGMA table_info(rule_sets)").fetchall()
         }
         _ensure_rule_set_column(connection, rule_set_columns, "max_external_gp", "INTEGER")
+        _ensure_rule_set_column(connection, rule_set_columns, "tags_not_contains", "TEXT NOT NULL DEFAULT ''")
         _ensure_rule_set_column(connection, rule_set_columns, "notes_contains", "TEXT NOT NULL DEFAULT ''")
         _ensure_rule_set_column(connection, rule_set_columns, "notes_not_contains", "TEXT NOT NULL DEFAULT ''")
         if revision_columns_added:
@@ -1337,6 +1339,7 @@ def save_rule_set(rule_set: Mapping[str, Any], db_path: str | Path | None = None
                     uploader_contains,
                     title_contains,
                     tags_contains,
+                    tags_not_contains,
                     notes_contains,
                     notes_not_contains,
                     rating_min,
@@ -1351,7 +1354,7 @@ def save_rule_set(rule_set: Mapping[str, Any], db_path: str | Path | None = None
                     max_external_gp,
                     created_epoch
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized["name"],
@@ -1363,6 +1366,7 @@ def save_rule_set(rule_set: Mapping[str, Any], db_path: str | Path | None = None
                     normalized["uploader_contains"],
                     normalized["title_contains"],
                     normalized["tags_contains"],
+                    normalized["tags_not_contains"],
                     normalized["notes_contains"],
                     normalized["notes_not_contains"],
                     normalized["rating_min"],
@@ -1393,6 +1397,7 @@ def save_rule_set(rule_set: Mapping[str, Any], db_path: str | Path | None = None
                 uploader_contains = ?,
                 title_contains = ?,
                 tags_contains = ?,
+                tags_not_contains = ?,
                 notes_contains = ?,
                 notes_not_contains = ?,
                 rating_min = ?,
@@ -1417,6 +1422,9 @@ def save_rule_set(rule_set: Mapping[str, Any], db_path: str | Path | None = None
                 normalized["uploader_contains"],
                 normalized["title_contains"],
                 normalized["tags_contains"],
+                normalized["tags_not_contains"],
+                normalized["notes_contains"],
+                normalized["notes_not_contains"],
                 normalized["rating_min"],
                 normalized["rating_max"],
                 normalized["filesize_min_bytes"],
@@ -1447,10 +1455,11 @@ def get_all_rule_sets(db_path: str | Path | None = None) -> list[dict[str, Any]]
                 match_folder_slot,
                 uploader_contains,
                 title_contains,
-                    tags_contains,
-                    notes_contains,
-                    notes_not_contains,
-                    rating_min,
+                tags_contains,
+                tags_not_contains,
+                notes_contains,
+                notes_not_contains,
+                rating_min,
                 rating_max,
                 filesize_min_bytes,
                 filesize_max_bytes,
@@ -1488,6 +1497,9 @@ def get_active_rule_sets(db_path: str | Path | None = None) -> list[dict[str, An
                 uploader_contains,
                 title_contains,
                 tags_contains,
+                tags_not_contains,
+                notes_contains,
+                notes_not_contains,
                 rating_min,
                 rating_max,
                 filesize_min_bytes,
@@ -1579,7 +1591,11 @@ def item_matches_rule_set(item: Mapping[str, Any], rule_set: Mapping[str, Any]) 
             return False
 
     tags_contains = str(rule_set.get("tags_contains", "") or "").strip().casefold()
-    if tags_contains and tags_contains not in _stringify_tags(item.get("tags", "")).casefold():
+    tag_value = _stringify_tags(item.get("tags", "")).casefold()
+    if tags_contains and tags_contains not in tag_value:
+        return False
+    tags_not_contains = str(rule_set.get("tags_not_contains", "") or "").strip().casefold()
+    if tags_not_contains and tags_not_contains in tag_value:
         return False
 
     rating_value = _safe_float(item.get("rating"))
@@ -1768,6 +1784,7 @@ def _normalize_rule_set_input(rule_set: Mapping[str, Any]) -> dict[str, Any]:
         "uploader_contains": str(rule_set.get("uploader_contains", "") or "").strip(),
         "title_contains": str(rule_set.get("title_contains", "") or "").strip(),
         "tags_contains": str(rule_set.get("tags_contains", "") or "").strip(),
+        "tags_not_contains": str(rule_set.get("tags_not_contains", "") or "").strip(),
         "notes_contains": str(rule_set.get("notes_contains", "") or "").strip(),
         "notes_not_contains": str(rule_set.get("notes_not_contains", "") or "").strip(),
         "rating_min": _safe_float(rule_set.get("rating_min")),
@@ -1797,6 +1814,7 @@ def _normalize_rule_set_row(row: Mapping[str, Any]) -> dict[str, Any]:
     record["posted_from_epoch"] = _safe_int(record.get("posted_from_epoch"))
     record["posted_to_epoch"] = _safe_int(record.get("posted_to_epoch"))
     record["max_external_gp"] = _safe_int(record.get("max_external_gp"))
+    record["tags_not_contains"] = str(record.get("tags_not_contains", "") or "")
     record["notes_contains"] = str(record.get("notes_contains", "") or "")
     record["notes_not_contains"] = str(record.get("notes_not_contains", "") or "")
     record["created_epoch"] = _safe_int(record.get("created_epoch")) or 0

@@ -18,6 +18,7 @@ import media_importer
 import qbittorrent_adapter
 import torrent_uploader
 import worker
+from search_utils import exclude_items_by_tags, extract_negative_tag_terms
 from lanraragi_sync import (
     LANRARAGI_FORCE_SYNC_KEY,
     LANRARAGI_LAST_STATUS_KEY,
@@ -299,6 +300,8 @@ def describe_rule_set(rule_set: dict[str, Any]) -> str:
         parts.append(f"Title: {rule_set['title_contains']}")
     if rule_set.get("tags_contains"):
         parts.append(f"Tag: {rule_set['tags_contains']}")
+    if rule_set.get("tags_not_contains"):
+        parts.append(f"Exclude Tag: {rule_set['tags_not_contains']}")
     if rule_set.get("rating_min") is not None or rule_set.get("rating_max") is not None:
         parts.append(
             f"Rating: {optional_float_text(rule_set.get('rating_min')) or '-inf'}"
@@ -565,7 +568,8 @@ def filter_items(
         and (not only_user_created_torrents or bool(item.get("torrent_from_archive", False)))
     ]
 
-    query = search_text.strip()
+    excluded_tags, query = extract_negative_tag_terms(search_text)
+    filtered = exclude_items_by_tags(filtered, excluded_tags)
     if not query:
         return filtered
 
@@ -2062,6 +2066,11 @@ def main() -> None:
                     value=optional_text(selected_rule_set.get("tags_contains") if selected_rule_set else ""),
                     placeholder="Example: female:office",
                 )
+                tag_not_contains = st.text_input(
+                    "Tag Does Not Contain",
+                    value=optional_text(selected_rule_set.get("tags_not_contains") if selected_rule_set else ""),
+                    placeholder="Example: male:human",
+                )
                 note_contains = st.text_input(
                     "Note Contains",
                     value=optional_text(selected_rule_set.get("notes_contains") if selected_rule_set else ""),
@@ -2156,6 +2165,7 @@ def main() -> None:
                             "uploader_contains": uploader_contains.strip(),
                             "title_contains": title_contains.strip(),
                             "tags_contains": tag_contains.strip(),
+                            "tags_not_contains": tag_not_contains.strip(),
                             "notes_contains": note_contains.strip(),
                             "notes_not_contains": note_not_contains.strip(),
                             "rating_min": parse_optional_float(rating_min_text, "Rating Min"),
@@ -2258,7 +2268,7 @@ def main() -> None:
 
     search_text = st.text_input(
         "Search",
-        placeholder="Search title/title_jpn, or use uploader:name, tag:teacher, note:phrase",
+        placeholder="Search titles, uploader:name, tag:teacher, -tag:teacher, or note:phrase",
         key=SEARCH_TEXT_KEY,
     )
     selected_categories = st.multiselect("Categories", options=category_options)

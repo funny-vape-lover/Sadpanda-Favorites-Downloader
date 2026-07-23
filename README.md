@@ -103,6 +103,18 @@ What each path is for:
 4. Let the worker scrape favorites and populate the database.
 5. Use the table filters or rules to queue downloads.
 
+## Search examples
+
+```text
+tag:female:office
+-tag:teacher
+tag:female:office -tag:teacher
+-tag:teacher -tag:male:human
+-tag:"female:big breasts"
+```
+
+`-tag:` removes galleries containing that case-insensitive tag text. Multiple exclusions can be combined.
+
 ## Notes
 
 - `config.json`, `dashboard.db`, `thumbnails/`, and download folders are local runtime data and should not be committed.
