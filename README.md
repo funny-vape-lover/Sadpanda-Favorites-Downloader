@@ -67,6 +67,7 @@ Important fields:
 - `qbittorrent.download_path`: where qBittorrent should save Sadpanda torrents
 - `paths.media_library`: where imported readable files should live
 - `paths.archive_library`: where direct archive downloads should live
+- `paths.hath_downloads`: optional H@H client `--download-dir`
 
 ## Folder structure
 
@@ -93,9 +94,11 @@ What each path is for:
 - `Sadpanda_Archives/`: direct archive downloads
 - `qbittorrent.download_path`: torrent payload location used by qBittorrent
 
-The archive downloader supports the site's direct Original Archive and Resample
-Archive methods. Hentai@Home delivery choices are intentionally excluded because
-they queue work to an H@H client rather than returning a direct download.
+The archive downloader supports direct Original Archive and Resample Archive
+downloads as well as H@H queueing. H@H jobs are submitted to the server-side
+queue and cannot be cancelled after submission. When `paths.hath_downloads`
+points to the H@H client's download directory, completed gallery folders are
+detected through `galleryinfo.txt` and imported into the media library.
 
 `Sadpanda_Media` and the qBittorrent download path should be on the same drive if you want hardlink imports to work efficiently.
 

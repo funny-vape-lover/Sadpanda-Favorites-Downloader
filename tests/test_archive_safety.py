@@ -13,15 +13,24 @@ from external_adapter import ExternalAdapter
 
 
 class ArchiveOptionSafetyTests(unittest.TestCase):
-    def test_hath_options_are_not_exposed_as_direct_downloads(self) -> None:
+    def test_hath_options_are_exposed_as_separate_queue_methods(self) -> None:
         adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
         adapter._parse_archive_options = Mock(return_value=[])  # type: ignore[method-assign]
         adapter._parse_hath_options = Mock(  # type: ignore[method-assign]
             return_value=[{"method": "hath_org", "available": True}]
         )
 
-        self.assertEqual(adapter._parse_options("<html></html>", "https://example.test"), [])
-        adapter._parse_hath_options.assert_not_called()
+        options = adapter._parse_options("<html></html>", "https://example.test")
+        self.assertEqual(options[0]["method"], "hath_org")
+        adapter._parse_hath_options.assert_called_once()
+
+    def test_hath_queue_success_is_recognized_without_archive_url(self) -> None:
+        adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
+        result = adapter._resolve_hath_queue_response(
+            "<p>An original resolution download has been queued for client 12345.</p>"
+        )
+
+        self.assertTrue(result["success"])
 
     def test_unrecognized_response_retains_page_reason(self) -> None:
         adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
@@ -72,6 +81,67 @@ class ExternalQueueSafetyTests(unittest.TestCase):
             self.assertEqual(item["local_status"], "error")
             self.assertIn("unexpected_response", item["archive_last_auto_error"])
             self.assertEqual(external_manager.get_external_queue(db_path, config), [])
+
+    def test_hath_queue_waits_for_client_then_imports_completed_directory(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "dashboard.db"
+            media = root / "media"
+            archives = root / "archives"
+            hath = root / "hath"
+            database.init_db(db_path)
+            with database.get_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO items (id, title, item_url, local_status, external_method)
+                    VALUES (?, ?, ?, 'force_external', 'hath_org')
+                    """,
+                    ("g-911853", "H@H Gallery", "https://exhentai.org/g/911853/abc/"),
+                )
+
+            adapter = Mock()
+            adapter.handle_item.return_value = {
+                "success": True,
+                "queued_hath": True,
+                "method": "hath_org",
+                "label": "H@H Original",
+                "size_text": "10 MiB",
+                "cost_gp": 0,
+                "request_submitted": True,
+            }
+            config = {
+                "paths": {
+                    "media_library": str(media),
+                    "archive_library": str(archives),
+                    "hath_downloads": str(hath),
+                }
+            }
+
+            external_manager.process_external_queue(db_path, config, adapter)
+            queued_item = database.get_item("g-911853", db_path)
+            self.assertEqual(queued_item["local_status"], "queued_hath")
+            self.assertFalse(queued_item["archive_downloaded"])
+            self.assertEqual(external_manager.get_external_queue(db_path, config), [])
+
+            completed = hath / "H@H Gallery [911853]"
+            completed.mkdir(parents=True)
+            (completed / "001.jpg").write_bytes(b"image")
+            (completed / "galleryinfo.txt").write_text("GID 911853", encoding="utf-8")
+
+            reconciled = external_manager.reconcile_hath_downloads(db_path, config)
+            self.assertEqual(len(reconciled), 1)
+            media_importer.import_completed_archives(db_path, config)
+
+            completed_item = database.get_item("g-911853", db_path)
+            self.assertTrue(completed_item["archive_downloaded"])
+            self.assertEqual(completed_item["local_status"], "completed")
+            imported_dirs = [
+                path
+                for path in media.iterdir()
+                if path.is_dir() and path.name.startswith("g-[911853] [archive] ")
+            ]
+            self.assertEqual(len(imported_dirs), 1)
+            self.assertTrue((imported_dirs[0] / "galleryinfo.txt").exists())
 
 
 class PartialAliasCleanupTests(unittest.TestCase):

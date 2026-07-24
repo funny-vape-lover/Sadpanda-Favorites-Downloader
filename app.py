@@ -65,6 +65,7 @@ STATUS_OPTIONS = [
     "force_queued",
     "force_external",
     "downloading_external",
+    "queued_hath",
     "downloading",
     "seeding",
     "completed",
@@ -144,6 +145,7 @@ STATUS_DISPLAY_LABELS = {
     "force_queued": "queued for torrent",
     "force_external": "queued for archive",
     "downloading_external": "downloading archive",
+    "queued_hath": "queued in H@H",
     "downloading": "downloading",
     "complete": "processing",
     "completed": "completed",
@@ -791,7 +793,7 @@ def _run_mass_archive_conversion(
             messages.append(f"{item['id']}: item no longer exists.")
             continue
         try:
-            update_item_status(item["id"], "creating_torrent", DB_PATH)
+            update_item_status(item["id"], "creating_torrent", db_path=DB_PATH)
             torrent_uploader.process_item(
                 item=current_item,
                 config=config,
@@ -890,6 +892,8 @@ def get_display_progress(item: dict[str, Any], config: dict[str, Any]) -> tuple[
     elif status_key in {"completed", "imported", "seeding"}:
         progress_pct = max(progress_pct, 100.0)
 
+    if status_key == "queued_hath":
+        return progress_pct, "Queued in H@H client; progress is external"
     if status_key in {"force_external", "downloading_external"}:
         return progress_pct, "Archive download progress"
     if status_key == "downloading":
@@ -1266,7 +1270,7 @@ def render_item_status_panel(
             format_func=display_status,
         )
         if st.button("Save Status", key=f"save_status_{item_id}", width="stretch"):
-            update_item_status(item_id, new_status, DB_PATH)
+            update_item_status(item_id, new_status, db_path=DB_PATH)
             st.rerun()
 
         st.write("**Download State**")
@@ -1281,12 +1285,18 @@ def render_item_status_panel(
             st.caption(f"Selected external method: {' | '.join(selection_bits)}")
         if archive_cancel_requested:
             st.caption("Archive cancellation requested. Waiting for the worker to stop the current stream.")
+        if current_status_key == "queued_hath":
+            st.info(
+                "This download is queued server-side for your H@H client and cannot "
+                "be cancelled here. Completion is detected when the configured H@H "
+                "download directory contains its finished gallery."
+            )
 
         if torrent_downloaded:
             st.success(torrent_downloaded_label)
             if st.button("Reimport Torrent", key=f"reimport_torrent_{item_id}", type="secondary", width="stretch"):
                 update_item_download_flags(item_id, torrent_downloaded=False, db_path=DB_PATH)
-                update_item_status(item_id, "complete", DB_PATH)
+                update_item_status(item_id, "complete", db_path=DB_PATH)
                 st.rerun()
         else:
             torrent_button_type = "secondary" if archive_downloaded else "primary"
@@ -1306,7 +1316,7 @@ def render_item_status_panel(
                 if current_status_key in {"force_external", "downloading_external"} or archive_cancel_requested:
                     update_item_download_flags(item_id, archive_downloaded=False, db_path=DB_PATH)
                     update_item_progress(item_id, 0.0, DB_PATH)
-                update_item_status(item_id, "force_queued", DB_PATH)
+                update_item_status(item_id, "force_queued", db_path=DB_PATH)
                 st.rerun()
             if not has_torrent_candidate:
                 st.caption("No torrent is available for this gallery.")
@@ -1325,7 +1335,7 @@ def render_item_status_panel(
                 width="stretch",
             ):
                 update_item_download_flags(item_id, archive_downloaded=False, db_path=DB_PATH)
-                update_item_status(item_id, "force_external", DB_PATH)
+                update_item_status(item_id, "force_external", db_path=DB_PATH)
                 st.rerun()
             if not torrent_downloaded:
                 if st.button(
@@ -1380,7 +1390,11 @@ def render_item_status_panel(
                 else:
                     set_archive_cancel_requested(item_id, False, DB_PATH)
                     update_item_progress(item_id, 0.0, DB_PATH)
-                    update_item_status(item_id, default_status_after_archive_cancel(current_item), DB_PATH)
+                    update_item_status(
+                        item_id,
+                        default_status_after_archive_cancel(current_item),
+                        db_path=DB_PATH,
+                    )
                 update_item_download_flags(item_id, archive_downloaded=False, db_path=DB_PATH)
                 st.rerun()
 
@@ -1478,6 +1492,14 @@ def render_config_sidebar_editor(config: dict[str, Any]) -> dict[str, Any]:
             archive_library = st.text_input(
                 "Archive Library Path",
                 value=str(paths_cfg.get("archive_library", "") or paths_cfg.get("archive_downloads", "") or ""),
+            )
+            hath_downloads = st.text_input(
+                "H@H Download Directory (optional)",
+                value=str(paths_cfg.get("hath_downloads", "") or ""),
+                help=(
+                    "The Hentai@Home client's --download-dir as visible inside this "
+                    "container. Completed galleries are detected by galleryinfo.txt."
+                ),
             )
 
             st.markdown("**qBittorrent**")
@@ -1584,6 +1606,7 @@ def render_config_sidebar_editor(config: dict[str, Any]) -> dict[str, Any]:
                 "media_library": media_library.strip(),
                 "archive_library": archive_library.strip(),
                 "archive_downloads": archive_library.strip(),
+                "hath_downloads": hath_downloads.strip(),
             }
             next_config["qbittorrent"] = {
                 "host": qb_host.strip(),
@@ -1703,7 +1726,7 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
 
     options = list(inspection.get("options", []))
     if not options:
-        st.warning("No direct archive options were detected on the archiver page.")
+        st.warning("No direct archive or H@H options were detected on the archiver page.")
         if st.button("Close", width="stretch"):
             clear_archive_dialog(item_id)
             st.rerun()
@@ -1743,6 +1766,12 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
     )
     selected_option = option_map[selected_method]
 
+    if selected_option.get("kind") == "hath":
+        st.warning(
+            "This queues the gallery to your account's H@H client. The queue is "
+            "server-side and cannot be cancelled after submission. Configure the "
+            "H@H Download Directory to let Sadpanda detect and import completion."
+        )
     if selected_option.get("cost_gp") not in (None, 0):
         st.warning(
             f"This choice will spend GP: {external_cost_label(selected_option.get('cost_gp'))}."
@@ -1751,7 +1780,8 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
         st.info("This choice is currently free.")
 
     confirm_col, cancel_col = st.columns(2)
-    if confirm_col.button("Confirm Download", type="primary", width="stretch"):
+    confirm_label = "Confirm H@H Queue" if selected_option.get("kind") == "hath" else "Confirm Download"
+    if confirm_col.button(confirm_label, type="primary", width="stretch"):
         update_item_external_selection(
             item_id,
             external_method=str(selected_option.get("method", "")),
@@ -1761,7 +1791,7 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
             db_path=DB_PATH,
         )
         set_archive_cancel_requested(item_id, False, DB_PATH)
-        update_item_status(item_id, "force_external", DB_PATH)
+        update_item_status(item_id, "force_external", db_path=DB_PATH)
         clear_archive_dialog(item_id)
         st.rerun()
 

@@ -146,13 +146,21 @@ def import_completed_archives(
             if source_path is None:
                 continue
 
-            destination_path = media_library / _build_media_filename(
-                item_id=item["id"],
-                title=item["title"],
-                suffix=source_path.suffix,
-                source="archive",
-            )
-            import_result = _import_single_file(source_path, destination_path)
+            if source_path.is_dir():
+                destination_path = media_library / _build_media_dirname(
+                    item_id=item["id"],
+                    title=item["title"],
+                    source="archive",
+                )
+                import_result = _import_directory_tree(source_path, destination_path)
+            else:
+                destination_path = media_library / _build_media_filename(
+                    item_id=item["id"],
+                    title=item["title"],
+                    suffix=source_path.suffix,
+                    source="archive",
+                )
+                import_result = _import_single_file(source_path, destination_path)
             actions.append(
                 {
                     "item_id": item["id"],

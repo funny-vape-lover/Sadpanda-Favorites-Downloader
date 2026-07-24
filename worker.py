@@ -664,6 +664,13 @@ def run_operational_cycle(
             db_path=DB_PATH,
             config=config,
         )
+        print("Reconciling H@H downloads...")
+        _safe(
+            "reconcile_hath_downloads",
+            external_manager.reconcile_hath_downloads,
+            db_path=DB_PATH,
+            config=config,
+        )
         print("Reconciling existing External Archive downloads...")
         _safe(
             "reconcile_external_imports",

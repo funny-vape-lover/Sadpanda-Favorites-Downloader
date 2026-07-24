@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -293,7 +294,34 @@ def process_external_queue(
         }
         actions.append(action)
 
-        if _is_success(result):
+        if _is_hath_queued(result):
+            update_item_external_selection(
+                item["id"],
+                external_method=str(result.get("method", "")),
+                external_label=str(result.get("label", "")),
+                external_size_text=str(result.get("size_text", "")),
+                external_cost_gp=result.get("cost_gp"),
+                db_path=db_path,
+            )
+            update_item_progress(item["id"], 0.0, db_path)
+            update_item_status(item["id"], "queued_hath", db_path=db_path)
+            update_archive_auto_queue(
+                item["id"],
+                enabled=False,
+                retry_after_epoch=0,
+                last_error="",
+                db_path=db_path,
+            )
+            resolve_error(
+                item_id=item["id"],
+                error_type=EXTERNAL_FAILURE_ERROR_TYPE,
+                db_path=db_path,
+            )
+            print(
+                f"H@H download queued for {item['id']} ({_safe_text(item['title'])}). "
+                "Waiting for the H@H client to complete it."
+            )
+        elif _is_success(result):
             if isinstance(result, dict):
                 update_item_external_selection(
                     item["id"],
@@ -479,6 +507,68 @@ def reconcile_external_imports(
     return updates
 
 
+def reconcile_hath_downloads(
+    db_path: str | Path,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    download_dir = _resolve_hath_download_dir(config)
+    if download_dir is None:
+        return []
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                title,
+                torrent_downloaded,
+                external_method,
+                archive_path
+            FROM items
+            WHERE archive_downloaded = 0
+              AND external_method LIKE 'hath_%'
+              AND local_status = 'queued_hath'
+            ORDER BY state_changed_epoch ASC, title COLLATE NOCASE ASC
+            """
+        ).fetchall()
+
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        match_path = _find_hath_download(download_dir, item["id"])
+        if match_path is None:
+            continue
+
+        update_item_archive_path(item["id"], str(match_path), db_path=db_path)
+        update_item_download_flags(item["id"], archive_downloaded=True, db_path=db_path)
+        if not bool(item.get("torrent_downloaded", False)):
+            update_media_primary_source(item["id"], "archive", db_path=db_path)
+        update_item_progress(item["id"], 100.0, db_path)
+        update_item_status(item["id"], "completed", db_path=db_path)
+        update_archive_auto_queue(
+            item["id"],
+            enabled=False,
+            retry_after_epoch=0,
+            last_error="",
+            db_path=db_path,
+        )
+        updates.append(
+            {
+                "item_id": item["id"],
+                "title": item["title"],
+                "path": str(match_path),
+                "size_bytes": _measure_path_size(match_path),
+            }
+        )
+        print(
+            f"Detected completed H@H download for {item['id']} "
+            f"({_safe_text(item['title'])}) at {_safe_text(match_path)}."
+        )
+
+    return updates
+
+
 def reconcile_missing_external_imports(
     db_path: str | Path,
     config: dict[str, Any],
@@ -531,7 +621,12 @@ def reconcile_missing_external_imports(
                 db_path=db_path,
             )
         elif str(item.get("external_method", "")).strip() and not bool(item.get("torrent_downloaded", False)):
-            update_item_status(item["id"], "force_external", db_path=db_path)
+            update_item_status(
+                item["id"],
+                "error",
+                error_message="Previously downloaded external content is missing or invalid.",
+                db_path=db_path,
+            )
         else:
             update_item_progress(item["id"], 0.0, db_path)
             update_item_status(
@@ -615,6 +710,35 @@ def _resolve_external_save_dir(config: dict[str, Any]) -> str:
     return str(Path(".").resolve() / "archive_downloads")
 
 
+def _resolve_hath_download_dir(config: dict[str, Any]) -> Path | None:
+    paths_config = config.get("paths", {})
+    if not isinstance(paths_config, dict):
+        return None
+    raw_path = paths_config.get("hath_downloads") or paths_config.get("hath_download_dir")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    return Path(raw_path).expanduser()
+
+
+def _find_hath_download(download_dir: Path, item_id: str) -> Path | None:
+    gid_match = re.search(r"(\d+)$", str(item_id or ""))
+    if gid_match is None or not download_dir.exists():
+        return None
+    gid = gid_match.group(1)
+
+    matches: list[Path] = []
+    for candidate in download_dir.iterdir():
+        if not candidate.is_dir() or not (candidate / "galleryinfo.txt").is_file():
+            continue
+        name_match = re.search(r"\[(\d+)(?:-[^\]]+)?\]$", candidate.name)
+        if (name_match and name_match.group(1) == gid) or candidate.name == gid:
+            matches.append(candidate)
+
+    if not matches:
+        return None
+    return max(matches, key=lambda candidate: candidate.stat().st_mtime)
+
+
 def _find_existing_archive(media_library: Path, item: dict[str, Any]) -> Path | None:
     stored_path = str(item.get("archive_path", "") or "").strip()
     if stored_path:
@@ -686,6 +810,14 @@ def _is_success(result: Any) -> bool:
         if "ok" in result:
             return bool(result.get("ok"))
     return bool(result)
+
+
+def _is_hath_queued(result: Any) -> bool:
+    return (
+        isinstance(result, dict)
+        and bool(result.get("success"))
+        and bool(result.get("queued_hath"))
+    )
 
 
 def _is_archive_cancel_requested(

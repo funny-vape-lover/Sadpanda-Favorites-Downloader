@@ -79,7 +79,7 @@ def check_missing_archives(db_path: str | Path, config: dict[str, Any]) -> list[
     with database.get_connection(db_path) as connection:
         rows = connection.execute(
             """
-            SELECT id, title, archive_path
+            SELECT id, title, archive_path, external_method
             FROM items
             WHERE archive_downloaded = 1
               AND COALESCE(is_latest_revision, 1) = 1
@@ -87,14 +87,23 @@ def check_missing_archives(db_path: str | Path, config: dict[str, Any]) -> list[
         ).fetchall()
     for row in rows:
         item = dict(row)
+        item_archive_library = archive_library
+        if str(item.get("external_method", "")).startswith("hath_"):
+            hath_dir = external_manager._resolve_hath_download_dir(config)  # type: ignore[attr-defined]
+            if hath_dir is not None:
+                item_archive_library = hath_dir
         stored_path = str(item.get("archive_path") or "")
         path = Path(stored_path) if stored_path else None
         if path and not path.is_absolute():
-            path = archive_library / path
+            path = item_archive_library / path
 
         missing = path is None or not path.exists() or external_manager._looks_like_html_file(path)  # type: ignore[attr-defined]
         if missing:
-            fallback = external_manager._find_existing_archive(archive_library, item)  # type: ignore[attr-defined]
+            fallback = (
+                external_manager._find_hath_download(item_archive_library, item["id"])  # type: ignore[attr-defined]
+                if str(item.get("external_method", "")).startswith("hath_")
+                else external_manager._find_existing_archive(item_archive_library, item)  # type: ignore[attr-defined]
+            )
             if fallback and not external_manager._looks_like_html_file(fallback):  # type: ignore[attr-defined]
                 missing = False
                 if str(item.get("archive_path") or "") != str(fallback):
@@ -105,7 +114,7 @@ def check_missing_archives(db_path: str | Path, config: dict[str, Any]) -> list[
             database.record_error(
                 item_id=item["id"],
                 error_type="missing_archive",
-                message=f"Archive file missing at {stored_path or archive_library}",
+                message=f"Archive file missing at {stored_path or item_archive_library}",
                 fix_hint="Re-download archive or re-link existing file.",
                 db_path=db_path,
             )

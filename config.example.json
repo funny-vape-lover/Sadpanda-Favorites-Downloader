@@ -7,7 +7,8 @@
   },
   "paths": {
     "media_library": "./Download_folders/Sadpanda_Media",
-    "archive_library": "./Download_folders/Sadpanda_Archives"
+    "archive_library": "./Download_folders/Sadpanda_Archives",
+    "hath_downloads": ""
   },
   "qbittorrent": {
     "host": "http://localhost",

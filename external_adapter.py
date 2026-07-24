@@ -144,6 +144,36 @@ class ExternalAdapter:
                 "request_submitted": True,
             }
 
+        if choice.get("kind") == "hath":
+            queue_result = self._resolve_hath_queue_response(response.text)
+            if queue_result.get("success"):
+                print(f"[{item_id}] H@H download successfully queued.")
+                return {
+                    "success": True,
+                    "item_id": item_id,
+                    "method": choice["method"],
+                    "label": choice["label"],
+                    "size_text": choice.get("size_text", ""),
+                    "cost_gp": choice.get("cost_gp"),
+                    "request_submitted": True,
+                    "queued_hath": True,
+                    "message": queue_result.get("message", ""),
+                }
+
+            reason = str(queue_result.get("reason") or "hath_queue_failed")
+            message = str(queue_result.get("message") or "")
+            print(f"[{item_id}] FAILED: {reason} | {message}")
+            return {
+                "success": False,
+                "item_id": item_id,
+                "reason": reason,
+                "message": message,
+                "method": choice["method"],
+                "label": choice["label"],
+                "cost_gp": choice.get("cost_gp"),
+                "request_submitted": True,
+            }
+
         resolution = self._resolve_download_page(response.text, response.url)
         download_url = resolution.get("download_url")
         filename_hint = resolution.get("filename", "")
@@ -545,6 +575,7 @@ class ExternalAdapter:
     def _parse_options(self, html: str, archiver_url: str) -> list[dict[str, Any]]:
         soup = BeautifulSoup(html, "html.parser")
         options = self._parse_archive_options(soup, archiver_url)
+        options.extend(self._parse_hath_options(soup, archiver_url))
         options.sort(key=lambda option: int(option.get("sort_order", 999)))
         return options
 
@@ -669,7 +700,11 @@ class ExternalAdapter:
         local_status = str(item.get("local_status", "")).strip().lower()
         if local_status in {"new", "queued"}:
             return self._auto_select_download_option(
-                list(available_options.values()),
+                [
+                    option
+                    for option in available_options.values()
+                    if option.get("kind") == "archive"
+                ],
                 max_external_gp=item.get("max_external_gp"),
             )
 
@@ -708,6 +743,52 @@ class ExternalAdapter:
                 int(option.get("sort_order", 999)),
             ),
         )[0]
+
+    def _resolve_hath_queue_response(self, html: str) -> dict[str, Any]:
+        soup = BeautifulSoup(html, "html.parser")
+        page_text = " ".join(soup.get_text(" ", strip=True).split())
+
+        if re.search(
+            r"download\s+has\s+been\s+queued\s+for\s+client",
+            page_text,
+            re.IGNORECASE,
+        ):
+            return {"success": True, "message": page_text[:500]}
+
+        lowered = page_text.casefold()
+        if "h@h client" in lowered and (
+            "do not have" in lowered
+            or "no " in lowered
+            or "need " in lowered
+            or "required" in lowered
+        ):
+            reason = "hath_client_missing"
+        elif "offline" in lowered:
+            reason = "hath_client_offline"
+        elif "resolution" in lowered and (
+            "cannot" in lowered or "unavailable" in lowered or "invalid" in lowered
+        ):
+            reason = "hath_resolution_unavailable"
+        elif "insufficient" in lowered or "you lack the" in lowered:
+            reason = "insufficient_gp"
+        else:
+            reason = "hath_queue_failed"
+
+        error_node = (
+            soup.select_one(".stuffbox")
+            or soup.select_one("p.br")
+            or soup.find("p")
+        )
+        message = (
+            " ".join(error_node.get_text(" ", strip=True).split())
+            if error_node is not None
+            else page_text[:500]
+        )
+        return {
+            "success": False,
+            "reason": reason,
+            "message": message or "H@H queue response was not recognized.",
+        }
 
     def _resolve_download_page(self, html: str, archiver_url: str) -> dict[str, Any]:
         soup = BeautifulSoup(html, "html.parser")
