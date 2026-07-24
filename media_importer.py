@@ -94,7 +94,7 @@ def import_completed_torrents(
                     db_path=db_path,
                 )
             final_status = _resolve_torrent_terminal_status(download_adapter, candidate["hash_string"])
-            update_item_status(item["id"], final_status, db_path)
+            update_item_status(item["id"], final_status, db_path=db_path)
 
             action = {
                 "item_id": item["id"],
@@ -114,7 +114,7 @@ def import_completed_torrents(
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Import failed for {item['id']} ({_safe_text(item['title'])}): {exc}")
-            update_item_status(item["id"], "error", db_path)
+            update_item_status(item["id"], "error", db_path=db_path)
             update_item_progress(item["id"], 0.0, db_path)
 
     return actions
@@ -138,6 +138,8 @@ def import_completed_archives(
             source_path = Path(stored_path) if stored_path else None
             if source_path and not source_path.is_absolute():
                 source_path = archive_library / source_path
+            if source_path is not None and not _is_not_partial(source_path):
+                source_path = None
 
             if source_path is None or not source_path.exists():
                 source_path = _find_existing_archive_source(archive_library, item["id"])
@@ -177,7 +179,7 @@ def import_completed_archives(
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Archive import failed for {item['id']} ({_safe_text(item['title'])}): {exc}")
-            update_item_status(item["id"], "error", db_path)
+            update_item_status(item["id"], "error", db_path=db_path)
             update_item_progress(item["id"], 0.0, db_path)
 
     return actions
@@ -191,6 +193,7 @@ def migrate_legacy_archive_storage(
     archive_library = _resolve_archive_library(config)
     media_library.mkdir(parents=True, exist_ok=True)
     archive_library.mkdir(parents=True, exist_ok=True)
+    cleanup_completed_partial_aliases(config)
 
     with get_connection(db_path) as connection:
         rows = connection.execute(
@@ -326,7 +329,7 @@ def reconcile_torrent_imports(
             continue
 
         update_item_download_flags(item["id"], torrent_downloaded=False, db_path=db_path)
-        update_item_status(item["id"], "complete", db_path)
+        update_item_status(item["id"], "complete", db_path=db_path)
         print(
             f"Reset missing torrent import for {item['id']} "
             f"({_safe_text(item['title'])}); source still exists in qB path."
@@ -466,7 +469,7 @@ def sync_torrent_terminal_statuses(
         if current_status == target_status:
             continue
 
-        update_item_status(item["id"], target_status, db_path)
+        update_item_status(item["id"], target_status, db_path=db_path)
         actions.append(
             {
                 "item_id": item["id"],
@@ -755,11 +758,11 @@ def _resolve_source_path(path: Path) -> Path:
     return path
 
 
-_PARTIAL_SUFFIXES = {".part", ".!qB", ".!qb", ".partial"}
+_PARTIAL_SUFFIXES = {".part", ".!qb", ".partial"}
 
 
 def _is_not_partial(path: Path) -> bool:
-    return path.suffix not in _PARTIAL_SUFFIXES
+    return path.suffix.lower() not in _PARTIAL_SUFFIXES
 
 
 def _ensure_not_partial(path: Path) -> None:
@@ -885,7 +888,11 @@ def _import_single_file(source_path: Path, destination_path: Path) -> dict[str, 
 
 
 def _import_directory_tree(source_root: Path, destination_root: Path) -> dict[str, Any]:
-    source_files = sorted(candidate for candidate in source_root.rglob("*") if candidate.is_file())
+    source_files = sorted(
+        candidate
+        for candidate in source_root.rglob("*")
+        if candidate.is_file() and _is_not_partial(candidate)
+    )
     if not source_files:
         raise FileNotFoundError(f"Source directory has no files: {source_root}")
 
@@ -1158,7 +1165,11 @@ def _find_legacy_media_path(
 
 
 def _list_media_library_entries(media_library: Path) -> list[Path]:
-    return list(media_library.iterdir())
+    return [
+        candidate
+        for candidate in media_library.iterdir()
+        if not candidate.is_file() or _is_not_partial(candidate)
+    ]
 
 
 def _find_existing_archive_source(archive_library: Path, item_id: str) -> Path | None:
@@ -1166,7 +1177,7 @@ def _find_existing_archive_source(archive_library: Path, item_id: str) -> Path |
     title = sanitize_filename_component(item_id.split(' ', 1)[-1]) if ' ' in item_id else ''
     candidates: list[Path] = []
     for candidate in archive_library.iterdir():
-        if not candidate.is_file():
+        if not candidate.is_file() or not _is_not_partial(candidate):
             continue
         name = candidate.name
         if name.startswith(f"{sanitize_filename_component(item_id)} "):
@@ -1179,6 +1190,51 @@ def _find_existing_archive_source(archive_library: Path, item_id: str) -> Path |
         return max(candidates, key=lambda candidate: candidate.stat().st_size)
     except OSError:
         return candidates[0]
+
+
+def cleanup_completed_partial_aliases(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Remove stale partial names only when a completed hardlink proves the data is safe."""
+    roots = {_resolve_media_library(config), _resolve_archive_library(config)}
+    inode_groups: dict[tuple[int, int], list[Path]] = {}
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for candidate in root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            try:
+                stat_result = candidate.stat()
+            except OSError:
+                continue
+            inode_groups.setdefault((stat_result.st_dev, stat_result.st_ino), []).append(candidate)
+
+    actions: list[dict[str, str]] = []
+    for aliases in inode_groups.values():
+        completed = [candidate for candidate in aliases if _is_not_partial(candidate)]
+        partials = [candidate for candidate in aliases if not _is_not_partial(candidate)]
+        if not completed or not partials:
+            continue
+
+        proof_path = completed[0]
+        for partial_path in partials:
+            try:
+                partial_path.unlink()
+            except OSError as exc:
+                print(f"Could not remove stale partial alias {partial_path}: {exc}")
+                continue
+            actions.append(
+                {
+                    "partial_path": str(partial_path),
+                    "completed_path": str(proof_path),
+                }
+            )
+            print(
+                f"Removed stale partial hardlink alias {partial_path}; "
+                f"completed alias remains at {proof_path}."
+            )
+
+    return actions
 
 
 def _hardlink_back_or_copy(source_path: Path, destination_path: Path) -> str:

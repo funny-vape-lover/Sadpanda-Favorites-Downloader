@@ -155,7 +155,7 @@ def process_queue(
                 f"({_safe_text(item['title'])}); leaving status as {item['local_status']}."
             )
             continue
-        update_item_status(item["id"], "downloading", db_path)
+        update_item_status(item["id"], "downloading", db_path=db_path)
         print(
             f"Enqueued {candidate['hash_string']} for {_safe_text(item['title'])} -> {save_path}. "
             f"Status transition: {item['id']} {item['local_status']} -> downloading"
@@ -216,7 +216,7 @@ def sync_active_downloads(
             _clear_metadata_recovery_tracking(item["id"])
             if not errored and item["local_status"] == "downloading":
                 update_item_progress(item["id"], 0.0, db_path)
-                update_item_status(item["id"], "new", db_path)
+                update_item_status(item["id"], "new", db_path=db_path)
                 print(
                     f"Reset stale torrent state for {candidate['hash_string']} "
                     f"({_safe_text(item['title'])}); qB no longer reports the torrent. "
@@ -227,7 +227,7 @@ def sync_active_downloads(
             continue
 
         if item["local_status"] in {"queued", "force_queued"}:
-            update_item_status(item["id"], "downloading", db_path)
+            update_item_status(item["id"], "downloading", db_path=db_path)
             print(
                 f"Recovered existing torrent state for {candidate['hash_string']} "
                 f"({_safe_text(item['title'])}). "
@@ -267,7 +267,7 @@ def sync_active_downloads(
             _clear_metadata_recovery_tracking(item["id"])
             update_item_progress(item["id"], 100.0, db_path)
             update_item_download_flags(item["id"], torrent_downloaded=True, db_path=db_path)
-            update_item_status(item["id"], "complete", db_path)
+            update_item_status(item["id"], "complete", db_path=db_path)
             print(
                 f"Completed {candidate['hash_string']} for {_safe_text(item['title'])}. "
                 f"Status transition: {item['id']} downloading -> complete"

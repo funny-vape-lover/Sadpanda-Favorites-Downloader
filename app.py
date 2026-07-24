@@ -1703,7 +1703,7 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
 
     options = list(inspection.get("options", []))
     if not options:
-        st.warning("No archive or H@H options were detected on the archiver page.")
+        st.warning("No direct archive options were detected on the archiver page.")
         if st.button("Close", width="stretch"):
             clear_archive_dialog(item_id)
             st.rerun()
@@ -1985,7 +1985,7 @@ def main() -> None:
         if fallback_to_external != external_fallback_enabled:
             set_bool_setting(FALLBACK_SETTING_KEY, fallback_to_external, DB_PATH)
             st.rerun()
-        st.caption("When enabled, matching items without torrents can use archive/H@H options within the active GP cap.")
+        st.caption("When enabled, matching items without torrents can use direct archive options within the active GP cap.")
 
         render_download_queue_sidebar(config)
 

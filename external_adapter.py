@@ -139,6 +139,9 @@ class ExternalAdapter:
                 "reason": "submit_failed",
                 "message": str(exc),
                 "method": choice["method"],
+                "label": choice["label"],
+                "cost_gp": choice.get("cost_gp"),
+                "request_submitted": True,
             }
 
         resolution = self._resolve_download_page(response.text, response.url)
@@ -170,6 +173,9 @@ class ExternalAdapter:
                     "reason": "poll_failed",
                     "message": str(exc),
                     "method": choice["method"],
+                    "label": choice["label"],
+                    "cost_gp": choice.get("cost_gp"),
+                    "request_submitted": True,
                 }
             resolution = self._resolve_download_page(response.text, response.url)
             download_url = resolution.get("download_url")
@@ -183,7 +189,11 @@ class ExternalAdapter:
                 "success": False,
                 "item_id": item_id,
                 "reason": reason,
+                "message": str(resolution.get("message", "") or ""),
                 "method": choice["method"],
+                "label": choice["label"],
+                "cost_gp": choice.get("cost_gp"),
+                "request_submitted": True,
             }
 
         if not download_url:
@@ -193,6 +203,9 @@ class ExternalAdapter:
                 "item_id": item_id,
                 "reason": "download_url_missing",
                 "method": choice["method"],
+                "label": choice["label"],
+                "cost_gp": choice.get("cost_gp"),
+                "request_submitted": True,
             }
 
         os.makedirs(save_dir, exist_ok=True)
@@ -237,6 +250,9 @@ class ExternalAdapter:
                         "reason": stream_result["reason"],
                         "message": stream_result.get("message", ""),
                         "method": choice["method"],
+                        "label": choice["label"],
+                        "cost_gp": choice.get("cost_gp"),
+                        "request_submitted": True,
                     }
         except requests.RequestException as exc:
             print(f"[{item_id}] FAILED during file download: {exc}")
@@ -246,6 +262,9 @@ class ExternalAdapter:
                 "reason": "file_download_failed",
                 "message": str(exc),
                 "method": choice["method"],
+                "label": choice["label"],
+                "cost_gp": choice.get("cost_gp"),
+                "request_submitted": True,
             }
 
         print(f"[{item_id}] Successfully saved to {save_path}")
@@ -257,6 +276,7 @@ class ExternalAdapter:
             "path": save_path,
             "size_text": size_label,
             "cost_gp": choice.get("cost_gp"),
+            "request_submitted": True,
         }
 
     def _stream_download_to_path(
@@ -525,7 +545,6 @@ class ExternalAdapter:
     def _parse_options(self, html: str, archiver_url: str) -> list[dict[str, Any]]:
         soup = BeautifulSoup(html, "html.parser")
         options = self._parse_archive_options(soup, archiver_url)
-        options.extend(self._parse_hath_options(soup, archiver_url))
         options.sort(key=lambda option: int(option.get("sort_order", 999)))
         return options
 
@@ -732,7 +751,13 @@ class ExternalAdapter:
         ):
             return {"status": "wait", "filename": filename}
 
-        return {"status": "error", "reason": "unexpected_response", "filename": filename}
+        page_text = " ".join(soup.get_text(" ", strip=True).split())
+        return {
+            "status": "error",
+            "reason": "unexpected_response",
+            "message": f"Archive request returned an unrecognized page: {page_text[:300]}",
+            "filename": filename,
+        }
 
     def _derive_filename(
         self,

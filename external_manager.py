@@ -11,6 +11,8 @@ from database import (
     get_connection,
     get_item,
     item_matches_rule_set,
+    record_error,
+    resolve_error,
     update_archive_auto_queue,
     update_item_archive_path,
     update_item_external_selection,
@@ -25,6 +27,7 @@ from database import (
 FALLBACK_SETTING_KEY = "external_archive_fallback_enabled"
 EXTERNAL_ACTIVE_STATUS = "downloading_external"
 AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS = 12 * 60 * 60
+EXTERNAL_FAILURE_ERROR_TYPE = "external_archive_failed"
 
 
 class ExternalAdapter(Protocol):
@@ -268,7 +271,7 @@ def process_external_queue(
         original_status = str(item.get("local_status", "") or "").strip().lower()
         if not is_auto_queue:
             update_item_progress(item["id"], 0.0, db_path)
-            update_item_status(item["id"], EXTERNAL_ACTIVE_STATUS, db_path)
+            update_item_status(item["id"], EXTERNAL_ACTIVE_STATUS, db_path=db_path)
         set_archive_cancel_requested(item["id"], False, db_path)
         result = external_adapter.handle_item(
             item,
@@ -308,12 +311,16 @@ def process_external_queue(
             set_archive_cancel_requested(item["id"], False, db_path)
             if is_auto_queue and bool(item.get("torrent_downloaded", False)):
                 if original_status in {"seeding", "completed", "complete"}:
-                    update_item_status(item["id"], original_status if original_status != "complete" else "completed", db_path)
+                    update_item_status(
+                        item["id"],
+                        original_status if original_status != "complete" else "completed",
+                        db_path=db_path,
+                    )
                 else:
-                    update_item_status(item["id"], "completed", db_path)
+                    update_item_status(item["id"], "completed", db_path=db_path)
                 update_media_primary_source(item["id"], "torrent", db_path=db_path)
             else:
-                update_item_status(item["id"], "completed", db_path)
+                update_item_status(item["id"], "completed", db_path=db_path)
                 if not bool(item.get("torrent_downloaded", False)):
                     update_media_primary_source(item["id"], "archive", db_path=db_path)
             update_archive_auto_queue(
@@ -323,30 +330,67 @@ def process_external_queue(
                 last_error="",
                 db_path=db_path,
             )
+            resolve_error(
+                item_id=item["id"],
+                error_type=EXTERNAL_FAILURE_ERROR_TYPE,
+                db_path=db_path,
+            )
             print(
                 f"External import completed for {item['id']} ({_safe_text(item['title'])}). "
                 f"Status transition: {item['local_status']} -> completed"
             )
         else:
+            failure_reason = _format_external_failure_reason(result)
+            was_cancelled = (
+                isinstance(result, dict)
+                and str(result.get("reason", "")).strip().lower() == "cancelled"
+            )
             if not is_auto_queue:
                 update_item_progress(item["id"], 0.0, db_path)
             set_archive_cancel_requested(item["id"], False, db_path)
             update_item_archive_path(item["id"], "", db_path=db_path)
             if is_auto_queue:
-                failure_reason = _format_external_failure_reason(result)
+                request_was_paid = _result_is_paid_submitted_request(result)
                 update_archive_auto_queue(
                     item["id"],
-                    enabled=True,
+                    enabled=not request_was_paid and not was_cancelled,
                     retry_after_epoch=now_epoch + AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS,
-                    last_error=failure_reason,
+                    last_error="" if was_cancelled else failure_reason,
                     db_path=db_path,
                 )
                 if original_status in {"seeding", "completed", "complete"}:
-                    update_item_status(item["id"], original_status if original_status != "complete" else "completed", db_path)
+                    update_item_status(
+                        item["id"],
+                        original_status if original_status != "complete" else "completed",
+                        db_path=db_path,
+                    )
             else:
                 next_status = _resolve_external_failure_status(item["id"], db_path, result)
                 if next_status:
-                    update_item_status(item["id"], next_status, db_path)
+                    update_item_status(
+                        item["id"],
+                        next_status,
+                        error_message=failure_reason if next_status == "error" else None,
+                        db_path=db_path,
+                    )
+                update_archive_auto_queue(
+                    item["id"],
+                    enabled=False,
+                    retry_after_epoch=now_epoch + AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS,
+                    last_error="" if was_cancelled else failure_reason,
+                    db_path=db_path,
+                )
+            if not was_cancelled:
+                record_error(
+                    item_id=item["id"],
+                    error_type=EXTERNAL_FAILURE_ERROR_TYPE,
+                    message=failure_reason,
+                    fix_hint=(
+                        "Review the response and manually queue Original Archive or "
+                        "Resample Archive when it is safe to retry."
+                    ),
+                    db_path=db_path,
+                )
             detail = ""
             if isinstance(result, dict):
                 reason = str(result.get("reason", "") or "").strip()
@@ -418,7 +462,7 @@ def reconcile_external_imports(
             db_path=db_path,
         )
         update_item_progress(item["id"], 100.0, db_path=db_path)
-        update_item_status(item["id"], "completed", db_path)
+        update_item_status(item["id"], "completed", db_path=db_path)
         updates.append(
             {
                 "item_id": item["id"],
@@ -481,12 +525,20 @@ def reconcile_missing_external_imports(
         if bool(item.get("archive_cancel_requested")):
             set_archive_cancel_requested(item["id"], False, db_path)
             update_item_progress(item["id"], 0.0, db_path)
-            update_item_status(item["id"], _resolve_cancel_target_status(item), db_path)
+            update_item_status(
+                item["id"],
+                _resolve_cancel_target_status(item),
+                db_path=db_path,
+            )
         elif str(item.get("external_method", "")).strip() and not bool(item.get("torrent_downloaded", False)):
-            update_item_status(item["id"], "force_external", db_path)
+            update_item_status(item["id"], "force_external", db_path=db_path)
         else:
             update_item_progress(item["id"], 0.0, db_path)
-            update_item_status(item["id"], _resolve_cancel_target_status(item), db_path)
+            update_item_status(
+                item["id"],
+                _resolve_cancel_target_status(item),
+                db_path=db_path,
+            )
 
         updates.append(
             {
@@ -665,7 +717,16 @@ def _resolve_external_failure_status(
     current_status = str(current_item.get("local_status", "") or "").strip().lower()
     if current_status not in {EXTERNAL_ACTIVE_STATUS, "force_external"}:
         return None
-    return "force_external"
+    return "error"
+
+
+def _result_is_paid_submitted_request(result: Any) -> bool:
+    if not isinstance(result, dict) or not bool(result.get("request_submitted")):
+        return False
+    try:
+        return int(result.get("cost_gp") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _format_external_failure_reason(result: Any) -> str:
