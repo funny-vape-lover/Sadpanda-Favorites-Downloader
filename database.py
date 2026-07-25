@@ -97,6 +97,7 @@ def init_db(db_path: str | Path | None = None) -> None:
                 media_primary_source TEXT NOT NULL DEFAULT 'torrent',
                 archive_auto_queue INTEGER NOT NULL DEFAULT 0,
                 archive_retry_after_epoch INTEGER NOT NULL DEFAULT 0,
+                archive_retry_count INTEGER NOT NULL DEFAULT 0,
                 archive_last_auto_error TEXT NOT NULL DEFAULT ''
             );
 
@@ -222,6 +223,7 @@ def init_db(db_path: str | Path | None = None) -> None:
         _ensure_item_column(connection, item_columns, "media_primary_source", "TEXT NOT NULL DEFAULT 'torrent'")
         _ensure_item_column(connection, item_columns, "archive_auto_queue", "INTEGER NOT NULL DEFAULT 0")
         _ensure_item_column(connection, item_columns, "archive_retry_after_epoch", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_item_column(connection, item_columns, "archive_retry_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_item_column(connection, item_columns, "archive_last_auto_error", "TEXT NOT NULL DEFAULT ''")
         _ensure_item_column(connection, item_columns, "last_error_message", "TEXT NOT NULL DEFAULT ''")
         _ensure_item_column(connection, item_columns, "last_error_epoch", "INTEGER NOT NULL DEFAULT 0")
@@ -849,6 +851,7 @@ def update_archive_auto_queue(
     *,
     enabled: bool,
     retry_after_epoch: int = 0,
+    retry_count: int = 0,
     last_error: str = "",
     db_path: str | Path | None = None,
 ) -> None:
@@ -859,6 +862,7 @@ def update_archive_auto_queue(
             SET
                 archive_auto_queue = ?,
                 archive_retry_after_epoch = ?,
+                archive_retry_count = ?,
                 archive_last_auto_error = ?,
                 state_changed_epoch = ?
             WHERE id = ?
@@ -866,6 +870,7 @@ def update_archive_auto_queue(
             (
                 1 if enabled else 0,
                 max(0, int(retry_after_epoch or 0)),
+                max(0, int(retry_count or 0)),
                 str(last_error or ""),
                 int(time.time()),
                 item_id,
@@ -990,6 +995,7 @@ def get_all_items_for_ui(db_path: str | Path | None = None) -> list[dict[str, An
                 items.media_primary_source,
                 items.archive_auto_queue,
                 items.archive_retry_after_epoch,
+                items.archive_retry_count,
                 items.archive_last_auto_error,
                 COUNT(torrents.hash_string) AS torrent_count,
                 MAX(CASE WHEN torrents.is_best_candidate THEN torrents.name ELSE '' END)
@@ -1033,6 +1039,7 @@ def get_all_items_for_ui(db_path: str | Path | None = None) -> list[dict[str, An
                 items.media_primary_source,
                 items.archive_auto_queue,
                 items.archive_retry_after_epoch,
+                items.archive_retry_count,
                 items.archive_last_auto_error
             ORDER BY items.last_updated_epoch DESC, items.title COLLATE NOCASE ASC
             """
@@ -1052,6 +1059,7 @@ def get_all_items_for_ui(db_path: str | Path | None = None) -> list[dict[str, An
         record["media_primary_source"] = str(record.get("media_primary_source", "torrent") or "torrent")
         record["archive_auto_queue"] = bool(record.get("archive_auto_queue", 0))
         record["archive_retry_after_epoch"] = int(record.get("archive_retry_after_epoch", 0) or 0)
+        record["archive_retry_count"] = int(record.get("archive_retry_count", 0) or 0)
         record["archive_last_auto_error"] = str(record.get("archive_last_auto_error", "") or "")
         record["favorite_note"] = str(record.get("favorite_note", "") or "")
         items.append(record)

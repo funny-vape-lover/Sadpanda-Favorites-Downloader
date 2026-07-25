@@ -95,10 +95,11 @@ What each path is for:
 - `qbittorrent.download_path`: torrent payload location used by qBittorrent
 
 The archive downloader supports direct Original Archive and Resample Archive
-downloads as well as H@H queueing. H@H jobs are submitted to the server-side
-queue and cannot be cancelled after submission. When `paths.hath_downloads`
-points to the H@H client's download directory, completed gallery folders are
-detected through `galleryinfo.txt` and imported into the media library.
+downloads as well as H@H queueing. Transient direct-archive connection, response,
+and stream failures are retried with capped backoff. H@H jobs are submitted to
+the server-side queue and cannot be cancelled after submission. When
+`paths.hath_downloads` points to the H@H client's download directory, completed
+gallery folders are detected through `galleryinfo.txt` and imported.
 
 `Sadpanda_Media` and the qBittorrent download path should be on the same drive if you want hardlink imports to work efficiently.
 

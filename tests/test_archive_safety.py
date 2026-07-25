@@ -4,33 +4,57 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import database
 import external_manager
 import media_importer
+import requests
 from external_adapter import ExternalAdapter
 
 
 class ArchiveOptionSafetyTests(unittest.TestCase):
-    def test_hath_options_are_exposed_as_separate_queue_methods(self) -> None:
+    def test_hath_options_remain_available_as_queue_methods(self) -> None:
         adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
-        adapter._parse_archive_options = Mock(return_value=[])  # type: ignore[method-assign]
-        adapter._parse_hath_options = Mock(  # type: ignore[method-assign]
-            return_value=[{"method": "hath_org", "available": True}]
-        )
-
-        options = adapter._parse_options("<html></html>", "https://example.test")
+        html = """
+        <form id="hathdl_form">
+          <table><tr><td>
+            <p><a onclick="return do_hathdl('org')">Original</a></p>
+            <p>10 MiB</p><p>Free</p>
+          </td></tr></table>
+        </form>
+        """
+        options = adapter._parse_options(html, "https://example.test/archiver.php")
         self.assertEqual(options[0]["method"], "hath_org")
-        adapter._parse_hath_options.assert_called_once()
 
-    def test_hath_queue_success_is_recognized_without_archive_url(self) -> None:
+    def test_hath_queue_acknowledgement_is_recognized(self) -> None:
         adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
         result = adapter._resolve_hath_queue_response(
             "<p>An original resolution download has been queued for client 12345.</p>"
         )
+        self.assertTrue(result["success"])
+
+    @patch("external_adapter.time.sleep")
+    def test_safe_initial_get_retries_transient_disconnects(self, sleep_mock: Mock) -> None:
+        adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
+        response = Mock()
+        response.text = "<html></html>"
+        response.raise_for_status.return_value = None
+        adapter.session.get = Mock(
+            side_effect=[
+                requests.ConnectionError("remote disconnected"),
+                requests.ConnectionError("remote disconnected"),
+                response,
+            ]
+        )
+
+        result = adapter.inspect_item(
+            {"id": "g-1", "item_url": "https://exhentai.org/g/1/abc/"}
+        )
 
         self.assertTrue(result["success"])
+        self.assertEqual(adapter.session.get.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 2)
 
     def test_unrecognized_response_retains_page_reason(self) -> None:
         adapter = ExternalAdapter({"exhentai": {"cookies": ""}})
@@ -44,7 +68,13 @@ class ArchiveOptionSafetyTests(unittest.TestCase):
 
 
 class ExternalQueueSafetyTests(unittest.TestCase):
-    def test_manual_failure_is_not_automatically_resubmitted(self) -> None:
+    def test_retry_backoff_is_capped(self) -> None:
+        self.assertEqual(
+            [external_manager._archive_retry_delay(attempt) for attempt in range(1, 5)],
+            [30, 120, 600, 600],
+        )
+
+    def test_transient_manual_failure_stays_queued_with_backoff(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             root = Path(temp_dir)
             db_path = root / "dashboard.db"
@@ -78,9 +108,92 @@ class ExternalQueueSafetyTests(unittest.TestCase):
 
             item = database.get_item("g-1", db_path)
             self.assertIsNotNone(item)
-            self.assertEqual(item["local_status"], "error")
+            self.assertEqual(item["local_status"], "force_external")
+            self.assertEqual(item["archive_retry_count"], 1)
+            self.assertGreater(item["archive_retry_after_epoch"], 0)
             self.assertIn("unexpected_response", item["archive_last_auto_error"])
             self.assertEqual(external_manager.get_external_queue(db_path, config), [])
+
+    def test_nonretryable_failure_becomes_terminal_error(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "dashboard.db"
+            database.init_db(db_path)
+            with database.get_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO items (id, title, item_url, local_status, external_method)
+                    VALUES (?, ?, ?, 'force_external', 'archive_org')
+                    """,
+                    ("g-2", "Unavailable Gallery", "https://exhentai.org/g/2/abc/"),
+                )
+
+            adapter = Mock()
+            adapter.handle_item.return_value = {
+                "success": False,
+                "reason": "no_eligible_method",
+                "message": "No direct archive option is available.",
+            }
+            config = {
+                "paths": {
+                    "media_library": str(root / "media"),
+                    "archive_library": str(root / "archives"),
+                }
+            }
+
+            external_manager.process_external_queue(db_path, config, adapter)
+
+            item = database.get_item("g-2", db_path)
+            self.assertEqual(item["local_status"], "error")
+            self.assertEqual(item["archive_retry_count"], 0)
+
+    def test_retry_delay_is_enforced_when_archive_fallback_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "dashboard.db"
+            database.init_db(db_path)
+            database.set_setting(
+                external_manager.FALLBACK_SETTING_KEY,
+                "true",
+                db_path,
+            )
+            with database.get_connection(db_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO items (
+                        id,
+                        title,
+                        item_url,
+                        local_status,
+                        external_method,
+                        archive_retry_after_epoch
+                    )
+                    VALUES (?, ?, ?, 'force_external', 'archive_org', ?)
+                    """,
+                    (
+                        "g-3",
+                        "Delayed Gallery",
+                        "https://exhentai.org/g/3/abc/",
+                        4_102_444_800,
+                    ),
+                )
+
+            config = {
+                "paths": {
+                    "media_library": str(root / "media"),
+                    "archive_library": str(root / "archives"),
+                }
+            }
+
+            self.assertEqual(external_manager.get_external_queue(db_path, config), [])
+
+            with database.get_connection(db_path) as connection:
+                connection.execute(
+                    "UPDATE items SET archive_retry_after_epoch = 0 WHERE id = ?",
+                    ("g-3",),
+                )
+            queue = external_manager.get_external_queue(db_path, config)
+            self.assertEqual([item["id"] for item in queue], ["g-3"])
 
     def test_hath_queue_waits_for_client_then_imports_completed_directory(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:

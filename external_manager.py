@@ -27,7 +27,20 @@ from database import (
 
 FALLBACK_SETTING_KEY = "external_archive_fallback_enabled"
 EXTERNAL_ACTIVE_STATUS = "downloading_external"
-AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS = 12 * 60 * 60
+ARCHIVE_RETRY_DELAYS_SECONDS = (30, 2 * 60, 10 * 60)
+RETRYABLE_EXTERNAL_FAILURES = {
+    "request_failed",
+    "submit_failed",
+    "poll_failed",
+    "unexpected_response",
+    "download_url_missing",
+    "file_download_failed",
+    "stream_read_failed",
+    "followup_download_failed",
+    "html_instead_of_archive",
+    "empty_download",
+    "download_redirect_loop",
+}
 EXTERNAL_FAILURE_ERROR_TYPE = "external_archive_failed"
 
 
@@ -81,6 +94,7 @@ def get_external_queue(
                     items.archive_cancel_requested,
                     items.archive_auto_queue,
                     items.archive_retry_after_epoch,
+                    items.archive_retry_count,
                     items.archive_last_auto_error,
                     items.torrent_downloaded,
                     items.media_primary_source,
@@ -88,7 +102,11 @@ def get_external_queue(
                 FROM items
                 LEFT JOIN torrents ON torrents.parent_item_id = items.id
                 WHERE (
-                    (items.local_status IN ('force_external', 'downloading_external') AND items.archive_downloaded = 0)
+                    (
+                        items.local_status IN ('force_external', 'downloading_external')
+                        AND items.archive_downloaded = 0
+                        AND COALESCE(items.archive_retry_after_epoch, 0) <= ?
+                    )
                     OR (
                         items.archive_auto_queue = 1
                         AND items.archive_downloaded = 0
@@ -128,6 +146,7 @@ def get_external_queue(
                     items.archive_cancel_requested,
                     items.archive_auto_queue,
                     items.archive_retry_after_epoch,
+                    items.archive_retry_count,
                     items.archive_last_auto_error,
                     items.torrent_downloaded,
                     items.media_primary_source
@@ -145,7 +164,7 @@ def get_external_queue(
                     items.title COLLATE NOCASE ASC
                 """
                 ,
-                (now_epoch,),
+                (now_epoch, now_epoch),
             ).fetchall()
         else:
             rows = connection.execute(
@@ -176,6 +195,7 @@ def get_external_queue(
                     items.archive_cancel_requested,
                     items.archive_auto_queue,
                     items.archive_retry_after_epoch,
+                    items.archive_retry_count,
                     items.archive_last_auto_error,
                     items.torrent_downloaded,
                     items.media_primary_source,
@@ -183,7 +203,10 @@ def get_external_queue(
                 FROM items
                 LEFT JOIN torrents ON torrents.parent_item_id = items.id
                 WHERE (
-                    items.local_status IN ('force_external', 'downloading_external')
+                    (
+                        items.local_status IN ('force_external', 'downloading_external')
+                        AND COALESCE(items.archive_retry_after_epoch, 0) <= ?
+                    )
                     OR (
                         items.archive_auto_queue = 1
                         AND items.archive_downloaded = 0
@@ -211,6 +234,7 @@ def get_external_queue(
                     items.archive_cancel_requested,
                     items.archive_auto_queue,
                     items.archive_retry_after_epoch,
+                    items.archive_retry_count,
                     items.archive_last_auto_error,
                     items.torrent_downloaded,
                     items.media_primary_source
@@ -224,7 +248,7 @@ def get_external_queue(
                     items.title COLLATE NOCASE ASC
                 """
                 ,
-                (now_epoch,),
+                (now_epoch, now_epoch),
             ).fetchall()
 
     queue: list[dict[str, Any]] = []
@@ -309,6 +333,7 @@ def process_external_queue(
                 item["id"],
                 enabled=False,
                 retry_after_epoch=0,
+                retry_count=0,
                 last_error="",
                 db_path=db_path,
             )
@@ -373,17 +398,34 @@ def process_external_queue(
                 isinstance(result, dict)
                 and str(result.get("reason", "")).strip().lower() == "cancelled"
             )
+            retryable = not was_cancelled and _is_retryable_external_failure(result)
+            retry_count = int(item.get("archive_retry_count", 0) or 0) + 1
+            retry_delay = _archive_retry_delay(retry_count)
             if not is_auto_queue:
                 update_item_progress(item["id"], 0.0, db_path)
             set_archive_cancel_requested(item["id"], False, db_path)
             update_item_archive_path(item["id"], "", db_path=db_path)
-            if is_auto_queue:
-                request_was_paid = _result_is_paid_submitted_request(result)
+
+            if was_cancelled:
                 update_archive_auto_queue(
                     item["id"],
-                    enabled=not request_was_paid and not was_cancelled,
-                    retry_after_epoch=now_epoch + AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS,
-                    last_error="" if was_cancelled else failure_reason,
+                    enabled=False,
+                    retry_after_epoch=0,
+                    retry_count=0,
+                    last_error="",
+                    db_path=db_path,
+                )
+                if not is_auto_queue:
+                    next_status = _resolve_external_failure_status(item["id"], db_path, result)
+                    if next_status:
+                        update_item_status(item["id"], next_status, db_path=db_path)
+            elif retryable:
+                update_archive_auto_queue(
+                    item["id"],
+                    enabled=is_auto_queue,
+                    retry_after_epoch=now_epoch + retry_delay,
+                    retry_count=retry_count,
+                    last_error=failure_reason,
                     db_path=db_path,
                 )
                 if original_status in {"seeding", "completed", "complete"}:
@@ -392,30 +434,43 @@ def process_external_queue(
                         original_status if original_status != "complete" else "completed",
                         db_path=db_path,
                     )
+                elif not is_auto_queue:
+                    update_item_status(item["id"], "force_external", db_path=db_path)
+                print(
+                    f"External archive retry scheduled for {item['id']} in {retry_delay}s "
+                    f"(attempt {retry_count})."
+                )
             else:
-                next_status = _resolve_external_failure_status(item["id"], db_path, result)
-                if next_status:
-                    update_item_status(
-                        item["id"],
-                        next_status,
-                        error_message=failure_reason if next_status == "error" else None,
-                        db_path=db_path,
-                    )
                 update_archive_auto_queue(
                     item["id"],
                     enabled=False,
-                    retry_after_epoch=now_epoch + AUTO_ARCHIVE_RETRY_COOLDOWN_SECONDS,
-                    last_error="" if was_cancelled else failure_reason,
+                    retry_after_epoch=0,
+                    retry_count=0,
+                    last_error=failure_reason,
                     db_path=db_path,
                 )
+                if is_auto_queue:
+                    if original_status in {"seeding", "completed", "complete"}:
+                        update_item_status(
+                            item["id"],
+                            original_status if original_status != "complete" else "completed",
+                            db_path=db_path,
+                        )
+                else:
+                    update_item_status(
+                        item["id"],
+                        "error",
+                        error_message=failure_reason,
+                        db_path=db_path,
+                    )
             if not was_cancelled:
                 record_error(
                     item_id=item["id"],
                     error_type=EXTERNAL_FAILURE_ERROR_TYPE,
                     message=failure_reason,
                     fix_hint=(
-                        "Review the response and manually queue Original Archive or "
-                        "Resample Archive when it is safe to retry."
+                        "Transient failures retry automatically with capped backoff. "
+                        "Review the response if retries continue."
                     ),
                     db_path=db_path,
                 )
@@ -519,12 +574,7 @@ def reconcile_hath_downloads(
     with get_connection(db_path) as connection:
         rows = connection.execute(
             """
-            SELECT
-                id,
-                title,
-                torrent_downloaded,
-                external_method,
-                archive_path
+            SELECT id, title, torrent_downloaded
             FROM items
             WHERE archive_downloaded = 0
               AND external_method LIKE 'hath_%'
@@ -550,6 +600,7 @@ def reconcile_hath_downloads(
             item["id"],
             enabled=False,
             retry_after_epoch=0,
+            retry_count=0,
             last_error="",
             db_path=db_path,
         )
@@ -852,13 +903,16 @@ def _resolve_external_failure_status(
     return "error"
 
 
-def _result_is_paid_submitted_request(result: Any) -> bool:
-    if not isinstance(result, dict) or not bool(result.get("request_submitted")):
+def _is_retryable_external_failure(result: Any) -> bool:
+    if not isinstance(result, dict):
         return False
-    try:
-        return int(result.get("cost_gp") or 0) > 0
-    except (TypeError, ValueError):
-        return False
+    reason = str(result.get("reason", "") or "").strip().lower()
+    return reason in RETRYABLE_EXTERNAL_FAILURES
+
+
+def _archive_retry_delay(retry_count: int) -> int:
+    index = max(0, min(int(retry_count) - 1, len(ARCHIVE_RETRY_DELAYS_SECONDS) - 1))
+    return ARCHIVE_RETRY_DELAYS_SECONDS[index]
 
 
 def _format_external_failure_reason(result: Any) -> str:

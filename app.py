@@ -46,6 +46,7 @@ from database import (
     set_rule_set_active,
     set_archive_cancel_requested,
     set_setting,
+    update_archive_auto_queue,
     update_item_download_flags,
     update_item_external_selection,
     update_item_progress,
@@ -1255,6 +1256,8 @@ def render_item_status_panel(
         external_label = str(current_item.get("external_label", "") or "")
         external_size_text = str(current_item.get("external_size_text", "") or "")
         external_cost_gp = current_item.get("external_cost_gp")
+        archive_retry_after_epoch = int(current_item.get("archive_retry_after_epoch", 0) or 0)
+        archive_last_error = str(current_item.get("archive_last_auto_error", "") or "")
 
         if current_status not in STATUS_OPTIONS:
             status_options = [current_status, *STATUS_OPTIONS]
@@ -1283,6 +1286,10 @@ def render_item_status_panel(
             if external_size_text:
                 selection_bits.append(external_size_text)
             st.caption(f"Selected external method: {' | '.join(selection_bits)}")
+        if current_status_key == "force_external" and archive_retry_after_epoch:
+            st.caption(f"Next archive retry: {epoch_label(archive_retry_after_epoch)}")
+        if archive_last_error:
+            st.caption(f"Last archive failure: {archive_last_error}")
         if archive_cancel_requested:
             st.caption("Archive cancellation requested. Waiting for the worker to stop the current stream.")
         if current_status_key == "queued_hath":
@@ -1335,6 +1342,14 @@ def render_item_status_panel(
                 width="stretch",
             ):
                 update_item_download_flags(item_id, archive_downloaded=False, db_path=DB_PATH)
+                update_archive_auto_queue(
+                    item_id,
+                    enabled=False,
+                    retry_after_epoch=0,
+                    retry_count=0,
+                    last_error="",
+                    db_path=DB_PATH,
+                )
                 update_item_status(item_id, "force_external", db_path=DB_PATH)
                 st.rerun()
             if not torrent_downloaded:
@@ -1501,7 +1516,6 @@ def render_config_sidebar_editor(config: dict[str, Any]) -> dict[str, Any]:
                     "container. Completed galleries are detected by galleryinfo.txt."
                 ),
             )
-
             st.markdown("**qBittorrent**")
             qb_host = st.text_input("Host", value=str(qb_cfg.get("host", "localhost") or "localhost"))
             qb_port = st.number_input(
@@ -1791,6 +1805,14 @@ def render_archive_dialog(item: dict[str, Any]) -> None:
             db_path=DB_PATH,
         )
         set_archive_cancel_requested(item_id, False, DB_PATH)
+        update_archive_auto_queue(
+            item_id,
+            enabled=False,
+            retry_after_epoch=0,
+            retry_count=0,
+            last_error="",
+            db_path=DB_PATH,
+        )
         update_item_status(item_id, "force_external", db_path=DB_PATH)
         clear_archive_dialog(item_id)
         st.rerun()

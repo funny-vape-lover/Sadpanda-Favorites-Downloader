@@ -11,6 +11,9 @@ from bs4 import BeautifulSoup
 
 
 REQUEST_TIMEOUT = 30
+ARCHIVE_STREAM_READ_TIMEOUT = 180
+SAFE_GET_MAX_ATTEMPTS = 3
+SAFE_GET_BACKOFF_SECONDS = (2, 5)
 POLL_DELAY_SECONDS = 5
 MAX_POLL_ATTEMPTS = 10
 INITIAL_STREAM_CHUNK_SIZE = 64 * 1024
@@ -60,12 +63,10 @@ class ExternalAdapter:
 
         archiver_url = gallery_info["archiver_url"]
         try:
-            response = self.session.get(
+            response = self._get_with_retry(
                 archiver_url,
-                timeout=REQUEST_TIMEOUT,
                 headers={"Referer": str(item.get("item_url", "")).strip() or archiver_url},
             )
-            response.raise_for_status()
         except requests.RequestException as exc:
             return {
                 "success": False,
@@ -189,12 +190,10 @@ class ExternalAdapter:
             )
             time.sleep(POLL_DELAY_SECONDS)
             try:
-                response = self.session.get(
+                response = self._get_with_retry(
                     inspection["archiver_url"],
-                    timeout=REQUEST_TIMEOUT,
                     headers={"Referer": inspection["archiver_url"]},
                 )
-                response.raise_for_status()
             except requests.RequestException as exc:
                 print(f"[{item_id}] FAILED during polling: {exc}")
                 return {
@@ -244,13 +243,12 @@ class ExternalAdapter:
 
         try:
             print(f"[{item_id}] Archive server ready. Opening download stream...")
-            with self.session.get(
+            with self._get_with_retry(
                 download_url,
                 stream=True,
-                timeout=REQUEST_TIMEOUT,
+                read_timeout=ARCHIVE_STREAM_READ_TIMEOUT,
                 headers={"Referer": inspection["archiver_url"]},
             ) as response:
-                response.raise_for_status()
                 filename = self._derive_filename(
                     item_id=item_id,
                     title=title,
@@ -387,13 +385,12 @@ class ExternalAdapter:
                 }
 
             try:
-                active_response = self.session.get(
+                active_response = self._get_with_retry(
                     follow_url,
                     stream=True,
-                    timeout=REQUEST_TIMEOUT,
+                    read_timeout=ARCHIVE_STREAM_READ_TIMEOUT,
                     headers={"Referer": referer or active_response.url},
                 )
-                active_response.raise_for_status()
             except requests.RequestException as exc:
                 return {
                     "success": False,
@@ -408,6 +405,48 @@ class ExternalAdapter:
             "reason": "download_redirect_loop",
             "message": "Archive host kept returning HTML instead of file bytes.",
         }
+
+    def _get_with_retry(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        stream: bool = False,
+        read_timeout: int = REQUEST_TIMEOUT,
+    ) -> requests.Response:
+        last_error: requests.RequestException | None = None
+        for attempt in range(1, SAFE_GET_MAX_ATTEMPTS + 1):
+            try:
+                response = self.session.get(
+                    url,
+                    stream=stream,
+                    timeout=(REQUEST_TIMEOUT, read_timeout),
+                    headers=headers,
+                )
+                response.raise_for_status()
+                return response
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if status_code not in {408, 429} and status_code < 500:
+                    raise
+                if exc.response is not None:
+                    exc.response.close()
+            except requests.RequestException as exc:
+                last_error = exc
+
+            if attempt >= SAFE_GET_MAX_ATTEMPTS:
+                break
+            delay = SAFE_GET_BACKOFF_SECONDS[min(attempt - 1, len(SAFE_GET_BACKOFF_SECONDS) - 1)]
+            print(
+                f"Safe GET failed for {url}; retrying in {delay}s "
+                f"(attempt {attempt}/{SAFE_GET_MAX_ATTEMPTS}): {last_error}"
+            )
+            time.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise requests.RequestException(f"Safe GET failed without a response: {url}")
 
     def _write_stream_to_path(
         self,
@@ -468,6 +507,17 @@ class ExternalAdapter:
                 except OSError:
                     pass
             return self._cancelled_result(item_id)
+        except requests.RequestException as exc:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return {
+                "success": False,
+                "reason": "stream_read_failed",
+                "message": str(exc),
+            }
         except OSError as exc:
             if os.path.exists(temp_path):
                 try:
@@ -774,11 +824,7 @@ class ExternalAdapter:
         else:
             reason = "hath_queue_failed"
 
-        error_node = (
-            soup.select_one(".stuffbox")
-            or soup.select_one("p.br")
-            or soup.find("p")
-        )
+        error_node = soup.select_one(".stuffbox") or soup.select_one("p.br") or soup.find("p")
         message = (
             " ".join(error_node.get_text(" ", strip=True).split())
             if error_node is not None
